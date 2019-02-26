@@ -42,13 +42,13 @@ def print_pipeline(pipeline, issue_by_number) -> None:
         print_issue(issue, issue_by_number)
 
 
-def follow_links(links, **kwargs):
+def follow_links(links, **kwargs) -> T.Generator[requests.Response, None, None]:
     url = links.get('next', {}).get('url')
     while url:
         LOG.debug('following the next url %s', url)
         resp = requests.get(url, **kwargs)
         resp.raise_for_status()
-        yield resp.json()
+        yield resp
         url = resp.links.get('next', {}).get('url')
 
 
@@ -227,7 +227,7 @@ class GitHubRemote:
         else:
             return {}
 
-    def request_get(self, path, *args, **kwargs) -> requests.Response:
+    def request_get(self, path: str, *args, **kwargs) -> requests.Response:
         kwargs.setdefault('headers', {}).update(self._auth_header)
         return requests.get(self.endpoint + path, *args, **kwargs)
 
@@ -248,7 +248,7 @@ class GitHubRemote:
         resp.raise_for_status()
         issues = resp.json()
         for resp in follow_links(resp.links, headers=self._auth_header):
-            issues += resp
+            issues += resp.json()
         return issues
 
 
@@ -355,22 +355,22 @@ class LocalContext:
             return self.cache['board']
         try:
             board = self.zenhub.fetch_board(self.repo['id'])
-            self.cache['board'] = board
-            return board
         except FileNotFoundError:
             raise click.ClickException('no board found locally -- run \'zhub pull\' first')
+        self.cache['board'] = board
+        return board
 
-    def get_pipeline_by_id(self, pipeline_id: str):
+    def get_pipeline_by_id(self, pipeline_id: str) -> T.Union[None, T.Dict]:
         pipelines = self.board['pipelines']
         for pipeline in pipelines:
             if pipeline['id'] == pipeline_id:
                 return pipeline
         return None
 
-    def get_pipeline_by_name(self, pipeline_name: str):
+    def get_pipeline_by_name(self, pipeline_name: str) -> T.Union[None, T.Dict]:
         pipelines = self.board['pipelines']
         for pipeline in pipelines:
-            if pipeline['name'].lower() == pipeline.lower():
+            if pipeline['name'].lower() == pipeline_name.lower():
                 return pipeline
         return None
 
@@ -493,11 +493,10 @@ def cli_push(ctx):
     zenhub_remote = ZenHubRemote(ctx.obj['zenhub_endpoint'], ctx.obj['zenhub_token'])
     lctx = LocalContext(ctx.obj)
     for event in lctx.zenhub.events(lctx.repo['id']):
-        LOG.error(event)
         if event['type'] == 'move_issue':
             pass
             # zenhub_remote.move_issue(
-            #     ctx.repo['id'],
+            #     lctx.repo['id'],
             #     issue_number=event[''],
             # )
         elif event['type'] == 'estimate':
