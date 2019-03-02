@@ -138,10 +138,16 @@ class ZenHubLocal:
         with open(os.path.join(self.root, str(repo_id), 'board.json'), 'r') as fp:
             return json.load(fp)
 
-    def events(self, repo_id: int):
+    def events(self, repo_id: int) -> T.Generator[dict, None, None]:
         try:
             for line in open(os.path.join(self.root, str(repo_id), 'events')):
                 yield json.loads(line)
+        except FileNotFoundError:
+            pass
+
+    def remove_events(self, repo_id: int) -> None:
+        try:
+            os.remove(os.path.join(self.root, str(repo_id), 'events'))
         except FileNotFoundError:
             pass
 
@@ -338,24 +344,12 @@ class GitHubLocal:
 
 
 @click.group()
-@click.option('--zenhub-endpoint', default=ZENHUB_ENDPOINT)
 @click.option('--zenhub-token')
-@click.option('--github-endpoint', default=GITHUB_ENDPOINT)
 @click.option('--github-token')
-@click.option('--repository', help='specify as {owner}/{repo}')
 @click.pass_context
-def cli(ctx, zenhub_endpoint, zenhub_token, github_endpoint, github_token, repository):
-    try:
-        owner, repo = repository.split('/')
-    except ValueError:
-        raise click.BadOptionUsage('repository should be {owner}/{repo}')
-
+def cli(ctx, zenhub_token, github_token):
     ctx.obj = {
-        'github_endpoint': github_endpoint,
         'github_token': github_token,
-        'owner': owner,
-        'repo': repo,
-        'zenhub_endpoint': zenhub_endpoint,
         'zenhub_token': zenhub_token,
     }
 
@@ -504,15 +498,14 @@ def cli_estimate(ctx, value, issues):
         zenhub.estimate(lctx.repo['id'], issue_number, value)
 
 
-@cli.command(name='pull', help='pull repository issues from ZenHub and GitHub')
+@cli.command(name='pull', help='pull issues')
 @click.option('--assignee')
 @click.option('--milestone')
 @click.pass_context
 def cli_pull(ctx, assignee, milestone):
     github_local = GitHubLocal(GITHUB_CONFIG_DIR)
-    github_remote = GitHubRemote(ctx.obj['github_endpoint'], token=ctx.obj['github_token'])
+    github_remote = GitHubRemote(GITHUB_ENDPOINT, token=ctx.obj['github_token'])
 
-    # owner, repo = ctx.obj['owner'], ctx.obj['repo']
     owner, repo = read_current_owner_repo()
 
     LOG.info('pulling repo %s/%s', owner, repo)
@@ -524,39 +517,59 @@ def cli_pull(ctx, assignee, milestone):
     github_local.write_repo_issues(owner, repo, issues)
 
     zenhub_local = ZenHubLocal(ZENHUB_CONFIG_DIR)
-    zenhub_remote = ZenHubRemote(ctx.obj['zenhub_endpoint'], token=ctx.obj['zenhub_token'])
+    zenhub_remote = ZenHubRemote(ZENHUB_ENDPOINT, token=ctx.obj['zenhub_token'])
 
     LOG.info('pulling board for %s/%s', owner, repo)
     board = zenhub_remote.fetch_board(repo_content['id'])
     zenhub_local.write_board(repo_content['id'], board)
 
 
-@cli.command(name='push', help='push changes to ZenHub and GitHub')
+@cli.command(name='push', help='push changes')
 @click.pass_context
 def cli_push(ctx):
-    zenhub_remote = ZenHubRemote(ctx.obj['zenhub_endpoint'], ctx.obj['zenhub_token'])
+    zenhub_remote = ZenHubRemote(ZENHUB_ENDPOINT, ctx.obj['zenhub_token'])
     lctx = LocalContext(ctx.obj)
+
     for event in lctx.zenhub.events(lctx.repo['id']):
+        print_event(event, lctx)
         if event['type'] == 'move_issue':
-            pass
-            # zenhub_remote.move_issue(
-            #     lctx.repo['id'],
-            #     issue_number=event[''],
-            # )
+            body = event['body']
+            zenhub_remote.move_issue(
+                lctx.repo['id'],
+                issue_number=body['issue_number'],
+                position=body['position'],
+                pipeline_id=body['pipeline_id'],
+            )
         elif event['type'] == 'estimate':
-            pass
+            body = event['body']
+            zenhub_remote.estimate(
+                lctx.repo['id'],
+                issue_number=body['issue_number'],
+                value=body['value'],
+            )
         else:
-            raise RuntimeError('invalid event {}'.format(event['type']))
+            raise RuntimeError('invalid event {}'.format(event))
+
+    lctx.zenhub.remove_events(lctx.repo['id'])
 
 
-def print_events(events, lctx):
+def print_event(event, lctx: LocalContext):
+    if event['type'] == 'move_issue':
+        body = event['body']
+        click.echo('move issue #{issue_number} to {pipeline} at position {position}'.format(
+            issue_number=body['issue_number'],
+            pipeline=lctx.get_pipeline_by_id(body['pipeline_id'])['name'],
+            position=body['position'],
+        ))
+    elif event['type'] == 'estimate':
+        pass
+    else:
+        raise RuntimeError('invalid event {}'.format(event))
+
+
+def print_events(events: T.Iterator, lctx: LocalContext):
     for event in events:
-        if event['type'] == 'move_issue':
-            click.echo('move issue #{issue_number} to {pipeline} at position {position}'.format(
-                issue_number=event['body']['issue_number'],
-                pipeline=lctx.get_pipeline_by_id(event['body']['pipeline_id'])['name'],
-                position=event['body']['position'],
-            ))
+        print_event(event, lctx)
 
 
 @cli.command(name='events', help='list events')
@@ -564,6 +577,13 @@ def print_events(events, lctx):
 def cli_events(ctx):
     lctx = LocalContext(ctx.obj)
     print_events(lctx.zenhub.events(lctx.repo['id']), lctx)
+
+
+@cli.command(name='revert', help='remove events')
+@click.pass_context
+def cli_revert(ctx):
+    lctx = LocalContext(ctx.obj)
+    lctx.zenhub.remove_events(lctx.repo['id'])
 
 
 if __name__ == '__main__':
