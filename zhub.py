@@ -1,4 +1,5 @@
 import typing as T
+import configparser
 import os
 import json
 import logging
@@ -8,9 +9,10 @@ import requests
 import click
 
 
-CONFIG_DIR = os.path.expanduser('~/.zhub')
-ZENHUB_CONFIG_DIR = os.path.join(CONFIG_DIR, 'zenhub')
-GITHUB_CONFIG_DIR = os.path.join(CONFIG_DIR, 'github')
+GIT_DIR = '.git'
+ZHUB_DIR = os.path.join(GIT_DIR, 'zhub')
+ZENHUB_CONFIG_DIR = os.path.join(ZHUB_DIR, 'zenhub')
+GITHUB_CONFIG_DIR = os.path.join(ZHUB_DIR, 'github')
 ZENHUB_ENDPOINT = 'https://api.zenhub.io'
 GITHUB_ENDPOINT = 'https://api.github.com'
 
@@ -50,6 +52,35 @@ def follow_links(links, **kwargs) -> T.Generator[requests.Response, None, None]:
         resp.raise_for_status()
         yield resp
         url = resp.links.get('next', {}).get('url')
+
+
+def current_branch() -> str:
+    path = os.path.join(GIT_DIR, 'HEAD')
+    with open(path) as fp:
+        content = fp.read()
+    content = content.strip()
+    _, ref = content.split(':')
+    return ref.split('/')[-1]
+
+
+def get_remote_url(branch: str):
+    with open(os.path.join(GIT_DIR, 'config')) as fp:
+        config = configparser.ConfigParser()
+        config.read_file(fp)
+    remote = config.get('branch "{}"'.format(branch), 'remote')
+    return config.get('remote "{}"'.format(remote), 'url')
+
+
+# FIXME
+def parse_owner_repo_from_remote_url(url: str) -> T.Tuple[str, str]:
+    host, owner_repo = url.split(':')
+    return owner_repo[:-4].split('/')
+
+
+def read_current_owner_repo() -> T.Tuple[str, str]:
+    branch = current_branch()
+    url = get_remote_url(branch)
+    return parse_owner_repo_from_remote_url(url)
 
 
 class ZenHubRemote:
@@ -320,12 +351,12 @@ def cli(ctx, zenhub_endpoint, zenhub_token, github_endpoint, github_token, repos
         raise click.BadOptionUsage('repository should be {owner}/{repo}')
 
     ctx.obj = {
-        'zenhub_endpoint': zenhub_endpoint,
-        'zenhub_token': zenhub_token,
         'github_endpoint': github_endpoint,
         'github_token': github_token,
         'owner': owner,
         'repo': repo,
+        'zenhub_endpoint': zenhub_endpoint,
+        'zenhub_token': zenhub_token,
     }
 
     LOG.debug('config %s', ctx.obj)
@@ -342,10 +373,18 @@ class LocalContext:
     def repo(self):
         if 'repo' in self.cache:
             return self.cache['repo']
+
+        owner, repo = read_current_owner_repo()
+        # self.ctx_obj['owner'], self.ctx_obj['repo']
+
         try:
-            repo = self.github.fetch_repo(self.ctx_obj['owner'], self.ctx_obj['repo'])
+            repo = self.github.fetch_repo(owner, repo)
         except FileNotFoundError:
-            raise click.ClickException('no repo found locally -- run \'zhub pull\' first')
+            raise click.ClickException('no issues found for {owner}/{repo} locally -- run \'zhub pull\' first'.format(
+                owner=owner,
+                repo=repo,
+            ))
+
         self.cache['repo'] = repo
         return repo
 
@@ -375,15 +414,19 @@ class LocalContext:
         return None
 
     def issues(self, assignee=None, milestone=None):
+        owner, repo = read_current_owner_repo()
         try:
             return self.github.fetch_repo_issues(
-                self.ctx_obj['owner'],
-                self.ctx_obj['repo'],
+                owner,
+                repo,
                 assignee=assignee,
                 milestone=milestone,
             )
         except FileNotFoundError:
-            raise click.ClickException('no issues found locally -- run \'zhub pull\' first')
+            raise click.ClickException('no issues found for {owner}/{repo} locally -- run \'zhub pull\' first'.format(
+                owner=owner,
+                repo=repo,
+            ))
 
 
 @cli.command(name='list', help='list issues')
@@ -469,7 +512,8 @@ def cli_pull(ctx, assignee, milestone):
     github_local = GitHubLocal(GITHUB_CONFIG_DIR)
     github_remote = GitHubRemote(ctx.obj['github_endpoint'], token=ctx.obj['github_token'])
 
-    owner, repo = ctx.obj['owner'], ctx.obj['repo']
+    # owner, repo = ctx.obj['owner'], ctx.obj['repo']
+    owner, repo = read_current_owner_repo()
 
     LOG.info('pulling repo %s/%s', owner, repo)
     repo_content = github_remote.fetch_repo(owner, repo)
