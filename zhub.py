@@ -424,9 +424,9 @@ class LocalContext:
 
 
 @cli.command(name='list', help='list issues')
-@click.option('--assignee')
-@click.option('--milestone')
-@click.option('--json', 'fmt_json', is_flag=True, default=False)
+@click.option('-a', '--assignee', help='filter issues by assignees')
+@click.option('-m', '--milestone', help='filer issues by milestone')
+@click.option('--json', 'fmt_json', is_flag=True, default=False, help='print issues as JSON')
 @click.argument('pipelines', nargs=-1)
 @click.pass_context
 def cli_list(ctx, assignee, milestone, fmt_json, pipelines):
@@ -445,11 +445,19 @@ def cli_list(ctx, assignee, milestone, fmt_json, pipelines):
     else:
         found_pipelines = lctx.board['pipelines']
 
-    for pipeline in found_pipelines:
-        if fmt_json:
-            print(json.dumps(pipeline))
-        else:
+    if fmt_json:
+        print(json.dumps(found_pipelines))
+    else:
+        for pipeline in found_pipelines:
             print_pipeline(pipeline, issue_by_number)
+
+
+def read_issues_from_pipelines(pipelines: T.Iterator):
+    issues = []
+    for pp in pipelines:
+        for issue in pp['issues']:
+            issues.append(issue['issue_number'])
+    return issues
 
 
 @cli.command(name='move', help='move issues to the pipeline')
@@ -461,7 +469,7 @@ def cli_move(ctx, pipeline: str, issues: T.List[int]):
 
     if len(issues) <= 0:
         try:
-            issues = [int(issue) for issue in sys.stdin]
+            issues = read_issues_from_pipelines(json.load(sys.stdin))
         except ValueError:
             raise click.BadArgumentUsage('issue number is expected')
 
@@ -489,7 +497,7 @@ def cli_estimate(ctx, value, issues):
 
     if len(issues) <= 0:
         try:
-            issues = [int(issue) for issue in sys.stdin]
+            issues = read_issues_from_pipelines(json.load(sys.stdin))
         except ValueError:
             raise click.BadArgumentUsage('issue number is expected')
 
