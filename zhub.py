@@ -4,6 +4,7 @@ import os
 import json
 import logging
 import sys
+import threading
 
 import requests
 import click
@@ -507,32 +508,66 @@ def cli_estimate(ctx, value, issues):
 
 
 @cli.command(name='pull', help='pull issues')
-@click.option('--assignee')
-@click.option('--milestone')
+@click.option('-a', '--assignee', help='filter issues by assignees')
+@click.option('-m', '--milestone', help='filer issues by milestone')
 @click.pass_context
 def cli_pull(ctx, assignee, milestone):
     github_local = GitHubLocal(GITHUB_CONFIG_DIR)
     github_remote = GitHubRemote(GITHUB_ENDPOINT, token=ctx.obj['github_token'])
 
-    owner, repo = read_current_owner_repo()
-
-    LOG.info('pulling repo %s/%s', owner, repo)
-    repo_content = github_remote.fetch_repo(owner, repo)
-    github_local.write_repo(owner, repo, repo_content)
-
-    LOG.info('pulling issues from %s/%s', owner, repo)
-    issues = github_remote.fetch_repo_issues(owner, repo, assignee=assignee, milestone=milestone)
-    github_local.write_repo_issues(owner, repo, issues)
-
     zenhub_local = ZenHubLocal(ZENHUB_CONFIG_DIR)
     zenhub_remote = ZenHubRemote(ZENHUB_ENDPOINT, token=ctx.obj['zenhub_token'])
 
-    LOG.info('pulling board for %s/%s', owner, repo)
-    board = zenhub_remote.fetch_board(repo_content['id'])
-    zenhub_local.write_board(repo_content['id'], board)
+    owner, repo = read_current_owner_repo()
+
+    def _pull_repo_and_board():
+        LOG.info('pulling repo %s/%s', owner, repo)
+        repo_content = github_remote.fetch_repo(owner, repo)
+        github_local.write_repo(owner, repo, repo_content)
+        LOG.info('pulling ZenHub board for %s/%s', owner, repo)
+        board = zenhub_remote.fetch_board(repo_content['id'])
+        zenhub_local.write_board(repo_content['id'], board)
+
+    t1 = threading.Thread(target=_pull_repo_and_board)
+
+    def _pull_issues():
+        LOG.info('pulling issues from %s/%s', owner, repo)
+        issues = github_remote.fetch_repo_issues(owner, repo, assignee=assignee, milestone=milestone)
+        github_local.write_repo_issues(owner, repo, issues)
+
+    t2 = threading.Thread(target=_pull_issues)
+
+    t1.start()
+    t2.start()
+
+    t1.join()
+    t2.join()
 
 
-@cli.command(name='push', help='push changes')
+def print_event(event, lctx: LocalContext):
+    if event['type'] == 'move_issue':
+        body = event['body']
+        click.echo('move issue #{issue_number} to {pipeline} at position {position}'.format(
+            issue_number=body['issue_number'],
+            pipeline=lctx.get_pipeline_by_id(body['pipeline_id'])['name'],
+            position=body['position'],
+        ))
+    elif event['type'] == 'estimate':
+        body = event['body']
+        click.echo('estimate issue #{issue_number} to {value}'.format(
+            issue_number=body['issue_number'],
+            value=body['value'],
+        ))
+    else:
+        raise RuntimeError('invalid event {}'.format(event))
+
+
+def print_events(events: T.Iterator, lctx: LocalContext):
+    for event in events:
+        print_event(event, lctx)
+
+
+@cli.command(name='push', help='push pending changes')
 @click.pass_context
 def cli_push(ctx):
     zenhub_remote = ZenHubRemote(ZENHUB_ENDPOINT, ctx.obj['zenhub_token'])
@@ -561,38 +596,36 @@ def cli_push(ctx):
     lctx.zenhub.remove_events(lctx.repo['id'])
 
 
-def print_event(event, lctx: LocalContext):
-    if event['type'] == 'move_issue':
-        body = event['body']
-        click.echo('move issue #{issue_number} to {pipeline} at position {position}'.format(
-            issue_number=body['issue_number'],
-            pipeline=lctx.get_pipeline_by_id(body['pipeline_id'])['name'],
-            position=body['position'],
-        ))
-    elif event['type'] == 'estimate':
-        pass
-    else:
-        raise RuntimeError('invalid event {}'.format(event))
-
-
-def print_events(events: T.Iterator, lctx: LocalContext):
-    for event in events:
-        print_event(event, lctx)
-
-
-@cli.command(name='events', help='list events')
+@cli.command(name='events', help='list pending changes')
 @click.pass_context
 def cli_events(ctx):
     lctx = LocalContext(ctx.obj)
     print_events(lctx.zenhub.events(lctx.repo['id']), lctx)
 
 
-@cli.command(name='revert', help='remove events')
+@cli.command(name='revert', help='remove pending changes')
 @click.pass_context
 def cli_revert(ctx):
     lctx = LocalContext(ctx.obj)
     lctx.zenhub.remove_events(lctx.repo['id'])
 
 
+def configure_log(logger: logging.Logger) -> None:
+    formatter = logging.Formatter('%(asctime)s - %(levelname)-8s - %(name)s:%(lineno)s - %(message)s')
+
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(formatter)
+    handler.setLevel(logging.INFO)
+    logger.addHandler(handler)
+
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(formatter)
+    handler.setLevel(logging.WARNING)
+    logger.addHandler(handler)
+
+    logger.setLevel(logging.INFO)
+
+
 if __name__ == '__main__':
+    configure_log(LOG)
     cli(auto_envvar_prefix='ZHUB')
