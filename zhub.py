@@ -21,8 +21,9 @@ GITHUB_ENDPOINT = 'https://api.github.com'
 LOG = logging.getLogger(__name__)
 
 
-def findf(f, list: T.Iterable):
-    for x in list:
+def findf(f: T.Callable[[T.Any], bool], lista: T.Iterable):
+    for x in lista:
+        assert x is not None
         if f(x):
             return x
     return None
@@ -275,19 +276,63 @@ class GitHubRemote:
         resp.raise_for_status()
         return resp.json()
 
-    def fetch_repo_issues(self, owner: str, repo: str, assignee=None, milestone=None) -> T.List[dict]:
+    def fetch_repo_issues(self, owner: str, repo: str, filters: dict = None) -> T.List[dict]:
+        if filters is None:
+            filters = {}
         path = '/repos/{owner}/{repo}/issues'.format(owner=owner, repo=repo)
         params = {'per_page': 100}
-        if assignee is not None:
-            params['assignee'] = assignee
-        if milestone is not None:
-            params['milestone'] = milestone
+        params.update(filters)
         resp = self.request_get(path, params)
         resp.raise_for_status()
         issues = resp.json()
         for resp in follow_links(resp.links, headers=self._auth_header):
             issues += resp.json()
         return issues
+
+
+def filter_issues(issues: list, filters: dict) -> T.Iterator[dict]:
+    # filter by assignee
+    assignee = filters.get('assignee')
+    if assignee == 'none':
+        f = lambda issue: len(issue['assignees']) <= 0
+    elif assignee == '*':
+        f = lambda issue: 0 < len(issue['assignees'])
+    elif assignee:
+        f = lambda issue: findf(lambda a: a['login'] == assignee, issue['assignees'])
+    else:
+        f = lambda issue: True
+    issues = filter(f, issues)
+
+    # filter by milestone
+    milestone = filters.get('milestone')
+    if milestone == 'none':
+        f = lambda issue: issue.get('milestone') is None
+    elif milestone == '*':
+        f = lambda issue: issue.get('milestone') is not None
+    elif milestone is not None:
+        try:
+            number = int(milestone)
+        except ValueError:
+            f = lambda issue: False
+        else:
+            f = lambda issue: issue.get('milestone') and issue['milestone'].get('number') == number
+    else:
+        f = lambda issue: True
+    issues = filter(f, issues)
+
+    # filter by labels
+    labels = filters.get('labels')
+    if labels is None:
+        f = lambda issue: True
+    else:
+        if isinstance(labels, str):
+            label_set = set(labels.split(','))
+        else:
+            label_set = set(labels)
+        f = lambda issue: label_set.intersection(map(lambda label: label['name'], issue.get('labels', [])))
+    issues = filter(f, issues)
+
+    return issues
 
 
 class GitHubLocal:
@@ -298,40 +343,12 @@ class GitHubLocal:
         with open(os.path.join(self.root, owner, repo, 'repo.json')) as fp:
             return json.load(fp)
 
-    def fetch_repo_issues(self, owner: str, repo: str, assignee=None, milestone=None) -> T.List[dict]:
+    def fetch_repo_issues(self, owner: str, repo: str, filters: dict = None) -> T.List[dict]:
+        if filters is None:
+            filters = {}
         with open(os.path.join(self.root, owner, repo, 'issues.json')) as fp:
             issues = json.load(fp)
-
-        # filter by assignee
-        if assignee == 'none':
-            f = lambda issue: len(issue['assignees']) <= 0
-        elif assignee == '*':
-            f = lambda issue: 0 < len(issue['assignees'])
-        elif assignee:
-            f = lambda issue: findf(lambda a: a['login'] == assignee, issue['assignees'])
-        else:
-            f = lambda issue: True
-
-        issues = filter(f, issues)
-
-        # filter by milestone
-        if milestone == 'none':
-            f = lambda issue: issue.get('milestone') is None
-        elif milestone == '*':
-            f = lambda issue: issue.get('milestone') is not None
-        elif milestone is not None:
-            try:
-                number = int(milestone)
-            except ValueError:
-                f = lambda issue: False
-            else:
-                f = lambda issue: issue.get('milestone') and issue['milestone'].get('number') == number
-        else:
-            f = lambda issue: True
-
-        issues = filter(f, issues)
-
-        return list(issues)
+        return list(filter_issues(issues, filters))
 
     def write_repo(self, owner: str, repo: str, content: dict) -> None:
         os.makedirs(os.path.join(self.root, owner, repo), exist_ok=True)
@@ -370,7 +387,6 @@ class LocalContext:
             return self.cache['repo']
 
         owner, repo = read_current_owner_repo()
-        # self.ctx_obj['owner'], self.ctx_obj['repo']
 
         try:
             repo = self.github.fetch_repo(owner, repo)
@@ -408,15 +424,15 @@ class LocalContext:
                 return pipeline
         return None
 
-    def issues(self, assignee=None, milestone=None):
+    def issues(self, assignee=None, milestone=None, labels=None):
         owner, repo = read_current_owner_repo()
+        filters = {
+            'assignee': assignee,
+            'milestone': milestone,
+            'labels': labels,
+        }
         try:
-            return self.github.fetch_repo_issues(
-                owner,
-                repo,
-                assignee=assignee,
-                milestone=milestone,
-            )
+            return self.github.fetch_repo_issues(owner, repo, filters=filters)
         except FileNotFoundError:
             raise click.ClickException('no issues found for {owner}/{repo} locally -- run \'zhub pull\' first'.format(
                 owner=owner,
@@ -427,13 +443,14 @@ class LocalContext:
 @cli.command(name='list', help='list issues')
 @click.option('-a', '--assignee', help='filter issues by assignees')
 @click.option('-m', '--milestone', help='filer issues by milestone')
+@click.option('-l', '--labels', help='filer issues by comma separated labels')
 @click.option('--json', 'fmt_json', is_flag=True, default=False, help='print issues as JSON')
 @click.argument('pipelines', nargs=-1)
 @click.pass_context
-def cli_list(ctx, assignee, milestone, fmt_json, pipelines):
+def cli_list(ctx, assignee, milestone, labels, fmt_json, pipelines):
     lctx = LocalContext(ctx.obj)
 
-    issues = lctx.issues(assignee=assignee, milestone=milestone)
+    issues = lctx.issues(assignee=assignee, milestone=milestone, labels=labels)
     issue_by_number = {}
     for issue in issues:
         issue_by_number[issue['number']] = issue
@@ -510,8 +527,9 @@ def cli_estimate(ctx, value, issues):
 @cli.command(name='pull', help='pull issues')
 @click.option('-a', '--assignee', help='filter issues by assignees')
 @click.option('-m', '--milestone', help='filer issues by milestone')
+@click.option('-l', '--labels', multiple=True, help='filer issues by comma separated labels')
 @click.pass_context
-def cli_pull(ctx, assignee, milestone):
+def cli_pull(ctx, assignee, milestone, labels):
     github_local = GitHubLocal(GITHUB_CONFIG_DIR)
     github_remote = GitHubRemote(GITHUB_ENDPOINT, token=ctx.obj['github_token'])
 
@@ -531,9 +549,15 @@ def cli_pull(ctx, assignee, milestone):
     t1 = threading.Thread(target=_pull_repo_and_board)
 
     def _pull_issues():
-        LOG.info('pulling issues from %s/%s', owner, repo)
-        issues = github_remote.fetch_repo_issues(owner, repo, assignee=assignee, milestone=milestone)
+        filters = {
+            'assignee': assignee,
+            'milestone': milestone,
+            'labels': labels,
+        }
+        LOG.info('pulling issues from %s/%s with filters: %s', owner, repo, json.dumps(filters))
+        issues = github_remote.fetch_repo_issues(owner, repo, filters=filters)
         github_local.write_repo_issues(owner, repo, issues)
+        LOG.info('fetched %s issues', len(issues))
 
     t2 = threading.Thread(target=_pull_issues)
 
